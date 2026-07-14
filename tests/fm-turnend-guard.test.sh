@@ -87,6 +87,7 @@ install_guard_scripts() {
   local dir=$1
   mkdir -p "$dir/bin"
   cp "$ROOT/bin/fm-turnend-guard.sh" "$dir/bin/fm-turnend-guard.sh"
+  cp "$ROOT/bin/fm-turnend-guard-codex.sh" "$dir/bin/fm-turnend-guard-codex.sh"
   cp "$ROOT/bin/fm-turnend-guard-grok.sh" "$dir/bin/fm-turnend-guard-grok.sh"
   cp "$ROOT/bin/fm-supervision-instructions.sh" "$dir/bin/fm-supervision-instructions.sh"
   cp "$ROOT/bin/fm-harness.sh" "$dir/bin/fm-harness.sh"
@@ -94,7 +95,7 @@ install_guard_scripts() {
   cp "$ROOT/bin/fm-wake-lib.sh" "$dir/bin/fm-wake-lib.sh"
   mkdir -p "$dir/docs"
   cp -R "$ROOT/docs/supervision-protocols" "$dir/docs/supervision-protocols"
-  chmod +x "$dir/bin/fm-turnend-guard.sh" "$dir/bin/fm-turnend-guard-grok.sh" "$dir/bin/fm-supervision-instructions.sh" "$dir/bin/fm-harness.sh"
+  chmod +x "$dir/bin/fm-turnend-guard.sh" "$dir/bin/fm-turnend-guard-codex.sh" "$dir/bin/fm-turnend-guard-grok.sh" "$dir/bin/fm-supervision-instructions.sh" "$dir/bin/fm-harness.sh"
 }
 
 mark_codex_hook_root() {
@@ -133,6 +134,35 @@ make_crewmate_worktree_dir() {
   mkdir -p "$dir/state"
   : > "$dir/AGENTS.md"
   install_guard_scripts "$dir"
+  printf '%s\n' "$dir"
+}
+
+# A secondmate home's OWN child crew/scout worktree: a genuine linked git
+# worktree of the secondmate home, so git-dir != git-common-dir exactly as for a
+# main-home child worktree. A child worktree never carries the gitignored
+# .fm-secondmate-home marker, so the marker force-include never fires for it and
+# it stays exempt through the linked-worktree git-dir test.
+make_secondmate_child_worktree_dir() {
+  local home=$1 dir=$2
+  git -C "$home" worktree add --quiet -b fm/turnend-secondmate-child "$dir"
+  mkdir -p "$dir/state"
+  : > "$dir/AGENTS.md"
+  install_guard_scripts "$dir"
+  printf '%s\n' "$dir"
+}
+
+# A treehouse-leased secondmate HOME: a genuine linked `git worktree` (git-dir !=
+# git-common-dir, exactly like a default treehouse-leased home) that DOES carry a
+# valid .fm-secondmate-home marker. This is the production topology the plain
+# git-init secondmate fixture cannot represent; the guard must force-INCLUDE it
+# as a guarded primary via the marker, not exempt it as a linked worktree.
+make_secondmate_linked_home_dir() {
+  local base=$1 dir=$2
+  fm_git_worktree "$base" "$dir" fm/turnend-secondmate-linked-home
+  mkdir -p "$dir/state"
+  : > "$dir/AGENTS.md"
+  install_guard_scripts "$dir"
+  printf 'sm-linked-1\n' > "$dir/.fm-secondmate-home"
   printf '%s\n' "$dir"
 }
 
@@ -312,14 +342,157 @@ test_hook_loop_guard_allows_retry() {
   pass "fm-turnend-guard: stop_hook_active=true always allows the stop (never blocks twice in one turn)"
 }
 
-test_hook_silent_in_secondmate_home() {
+# A secondmate's OWN home runs a primary firstmate session and must be guarded
+# exactly like the main primary. This was the guard's proven blind spot: the
+# .fm-secondmate-home marker used to early-exit here, so an overnight secondmate
+# could end a turn with an unsupervised child and sit blind. Removing that marker
+# check makes the guard fire, mirroring the cd-guard.
+test_hook_blocks_in_secondmate_own_home() {
   local dir out status
   dir=$(make_secondmate_dir "$TMP_ROOT/hook-secondmate")
   : > "$dir/state/task1.meta"
   out=$(run_hook "$dir" false); status=$?
-  expect_code 0 "$status" "hook must never block inside a secondmate home"
-  [ -z "$out" ] || fail "hook produced output inside a secondmate home: $out"
-  pass "fm-turnend-guard: inert in a secondmate home (.fm-secondmate-home marker present) even when unhealthy"
+  expect_code 2 "$status" "hook must guard a secondmate's own home like the main primary when unhealthy"
+  assert_contains "$out" "$REQUIRED_REASON" "block reason must contain the exact required instruction"
+  assert_contains "$out" "TURN WOULD END BLIND" "block banner must read as an alarm"
+  pass "fm-turnend-guard: blocks a blind turn end in a secondmate's own home (.fm-secondmate-home no longer excludes it)"
+}
+
+# Idle-by-default: an empty-queue secondmate has no in-flight meta, so the guard
+# exits at the in-flight gate - never forcing a busy continuation loop.
+test_hook_silent_in_idle_secondmate_home() {
+  local dir out status
+  dir=$(make_secondmate_dir "$TMP_ROOT/hook-secondmate-idle")
+  out=$(run_hook "$dir" false); status=$?
+  expect_code 0 "$status" "hook must stay silent in an idle, empty-queue secondmate home"
+  [ -z "$out" ] || fail "idle secondmate home produced guard output: $out"
+  pass "fm-turnend-guard: idle-by-default - silent in a secondmate home with nothing in flight"
+}
+
+# The stop_hook_active loop guard bounds the secondmate to one forced
+# continuation per turn, exactly as it does for the main primary - no wedged,
+# un-endable session.
+test_hook_secondmate_loop_guard_allows_retry() {
+  local dir out status
+  dir=$(make_secondmate_dir "$TMP_ROOT/hook-secondmate-loopguard")
+  : > "$dir/state/task1.meta"
+  out=$(run_hook "$dir" true); status=$?
+  expect_code 0 "$status" "hook must allow the stop in a secondmate home when stop_hook_active is already true"
+  [ -z "$out" ] || fail "secondmate loop-guarded retry produced output: $out"
+  pass "fm-turnend-guard: stop_hook_active=true allows the stop in a secondmate home (never blocks twice in one turn)"
+}
+
+# The guard's half of the deferred-death recovery loop in a secondmate home,
+# proven deterministically without a live model or any daemon: silent while the
+# watcher is live (the secondmate ends its turn and relies on the background
+# re-invoke), then blocks to force the re-arm once the watcher has exited and a
+# second child event lands. The live half - that Claude Code autonomously
+# re-invokes the model when the background watcher exits (Mechanism A) - is a
+# harness property recorded empirically in docs/turnend-guard.md; it needs a live
+# session and cannot be a hermetic CI assertion.
+test_hook_secondmate_reinvoke_recovery_loop() {
+  local dir pid identity out status
+  dir=$(make_secondmate_dir "$TMP_ROOT/hook-secondmate-reinvoke")
+  : > "$dir/state/child1.meta"
+  sleep 60 &
+  pid=$!
+  identity=$(watcher_identity "$dir" "$pid") || {
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    fail "could not identify live watcher holder"
+  }
+  record_watcher_lock "$dir" "$pid" "$identity"
+  touch "$dir/state/.last-watcher-beat"
+  out=$(run_hook "$dir" false); status=$?
+  expect_code 0 "$status" "secondmate turn must end silently while its watcher is live (Stop #1)"
+  [ -z "$out" ] || {
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    fail "guard nagged a healthy secondmate at Stop #1: $out"
+  }
+  # The watcher exits on the wake (its normal lifecycle) and a SECOND child event
+  # lands. On the re-invoked recovery turn the secondmate must re-arm; if it did
+  # not, the guard blocks that turn's end and forces the re-arm (Stop #2).
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  rm -rf "$dir/state/.watch.lock"
+  : > "$dir/state/child2.meta"
+  touch "$dir/state/.last-watcher-beat"
+  out=$(run_hook "$dir" false); status=$?
+  expect_code 2 "$status" "secondmate recovery turn must not end blind after the watcher exits (Stop #2)"
+  assert_contains "$out" "$REQUIRED_REASON" "block reason must contain the exact required instruction"
+  pass "fm-turnend-guard: secondmate deferred-death recovery - silent while watched, forces re-arm once the watcher exits"
+}
+
+# The marker force-include must guard only the secondmate's OWN home, never its
+# children: a secondmate's linked crew/scout worktree carries no marker, so it
+# stays exempt by the same git-dir/git-common-dir test that exempts the main
+# home's children.
+test_hook_silent_in_secondmate_child_worktree() {
+  local home dir out status
+  home=$(make_secondmate_dir "$TMP_ROOT/hook-sm-child-home")
+  dir="$TMP_ROOT/hook-sm-child-wt"
+  make_secondmate_child_worktree_dir "$home" "$dir" >/dev/null
+  : > "$dir/state/task1.meta"
+  out=$(run_hook "$dir" false); status=$?
+  expect_code 0 "$status" "hook must stay exempt in a secondmate's own child crew/scout worktree"
+  [ -z "$out" ] || fail "hook produced output inside a secondmate's child worktree: $out"
+  pass "fm-turnend-guard: inert in a secondmate's own child worktree (linked git worktree) even when unhealthy"
+}
+
+# THE regression the plain git-init fixtures masked: a treehouse-leased secondmate
+# home is a genuine LINKED worktree (git-dir != git-common-dir), which the
+# remove-only form wrongly exempted. With the marker force-include, its own
+# primary session is GUARDED. The test asserts the fixture really is a linked
+# worktree so it can never silently regress back into a plain-checkout shape.
+test_hook_blocks_in_treehouse_leased_secondmate_home() {
+  local base dir gd gcd out status
+  base="$TMP_ROOT/hook-sm-leased-base"
+  dir="$TMP_ROOT/hook-sm-leased-home"
+  make_secondmate_linked_home_dir "$base" "$dir" >/dev/null
+  gd=$(git -C "$dir" rev-parse --git-dir)
+  gcd=$(git -C "$dir" rev-parse --git-common-dir)
+  [ "$gd" != "$gcd" ] || fail "leased-home fixture must be a linked worktree (git-dir != git-common-dir), got equal: $gd"
+  : > "$dir/state/task1.meta"
+  out=$(run_hook "$dir" false); status=$?
+  expect_code 2 "$status" "hook must GUARD a treehouse-leased (linked) secondmate home via its marker when unhealthy"
+  assert_contains "$out" "$REQUIRED_REASON" "block reason must contain the exact required instruction"
+  assert_contains "$out" "TURN WOULD END BLIND" "block banner must read as an alarm"
+  pass "fm-turnend-guard: blocks a blind turn end in a treehouse-leased LINKED secondmate home (marker force-include)"
+}
+
+# Anti-spoof: a linked worktree with an INVALID (empty) marker must NOT be
+# force-included. Marker validation rejects it, so it falls through to the
+# linked-worktree exemption and stays exempt - a stray/empty marker file can
+# never spoof a child worktree into being guarded.
+test_hook_exempts_linked_worktree_with_stray_marker() {
+  local base dir out status
+  base="$TMP_ROOT/hook-stray-marker-base"
+  dir="$TMP_ROOT/hook-stray-marker-wt"
+  make_crewmate_worktree_dir "$base" "$dir" >/dev/null
+  : > "$dir/.fm-secondmate-home"
+  : > "$dir/state/task1.meta"
+  out=$(run_hook "$dir" false); status=$?
+  expect_code 0 "$status" "an empty/invalid marker must not spoof force-inclusion in a linked worktree"
+  [ -z "$out" ] || fail "stray empty marker wrongly force-included a linked worktree: $out"
+  pass "fm-turnend-guard: an invalid (empty) marker cannot spoof inclusion; linked worktree stays exempt"
+}
+
+# Anti-spoof under any locale: a NON-ASCII marker id must be REJECTED by the
+# ASCII-only (C-collation) allowlist, so it can never force-include a linked
+# worktree even where the ambient locale's collation would treat it as a letter.
+# Rejection -> git-dir exemption -> the linked worktree stays exempt.
+test_hook_exempts_linked_worktree_with_non_ascii_marker() {
+  local base dir out status
+  base="$TMP_ROOT/hook-nonascii-marker-base"
+  dir="$TMP_ROOT/hook-nonascii-marker-wt"
+  make_crewmate_worktree_dir "$base" "$dir" >/dev/null
+  printf 'caf\xc3\xa9\n' > "$dir/.fm-secondmate-home"
+  : > "$dir/state/task1.meta"
+  out=$(run_hook "$dir" false); status=$?
+  expect_code 0 "$status" "a non-ASCII marker id must not spoof force-inclusion in a linked worktree"
+  [ -z "$out" ] || fail "non-ASCII marker wrongly force-included a linked worktree: $out"
+  pass "fm-turnend-guard: a non-ASCII marker cannot spoof inclusion; linked worktree stays exempt"
 }
 
 test_hook_silent_in_crewmate_worktree() {
@@ -444,9 +617,135 @@ test_codex_hook_invokes_shared_guard() {
   [ -n "$command" ] || fail "Stop hook command is missing from .codex/hooks.json"
   assert_contains "$command" 'pwd -P' "codex hook must anchor from the hook process working directory"
   assert_contains "$command" '.codex/hooks.json' "codex hook must verify the hook-loaded firstmate root"
-  assert_contains "$command" 'fm-turnend-guard.sh' "codex hook must invoke the shared guard"
+  assert_contains "$command" 'fm-turnend-guard.sh' "codex hook must preserve the shared guard entrypoint for cached sessions"
+  assert_not_contains "$command" 'fm-turnend-guard-codex.sh' "codex hook must let the shared guard route Codex payloads"
+  assert_contains "$(cat "$ROOT/bin/fm-turnend-guard-codex.sh")" 'fm-turnend-guard.sh' "codex adapter must invoke the shared guard"
   assert_not_contains "$command" '.cwd' "codex hook must not use payload cwd to select the guard executable"
   pass ".codex/hooks.json: Stop hook invokes the shared primary guard"
+}
+
+test_codex_hook_never_blocks_when_watcher_is_unhealthy() {
+  local settings command dir payload out err status queue
+  settings="$ROOT/.codex/hooks.json"
+  [ -f "$settings" ] || fail "tracked .codex/hooks.json is missing"
+  command=$(jq -r '.hooks.Stop[0].hooks[0].command // empty' "$settings")
+  [ -n "$command" ] || fail "Stop hook command is missing from .codex/hooks.json"
+  dir=$(make_primary_dir "$TMP_ROOT/codex-hook-unhealthy")
+  mkdir -p "$dir/.codex"
+  cp "$settings" "$dir/.codex/hooks.json"
+  : > "$dir/state/task1.meta"
+  payload='{"session_id":"session-test","turn_id":"turn-test","hook_event_name":"Stop","stop_hook_active":false}'
+  err="$dir/codex-hook.err"
+  out=$(printf '%s' "$payload" | (cd "$dir" && bash -c "$command") 2>"$err"); status=$?
+  expect_code 0 "$status" "Codex Stop adapter must never block when the shared predicate finds an unhealthy watcher"
+  printf '%s' "$out" | jq -e '.continue == true and (.systemMessage | contains("TURN WOULD END BLIND"))' >/dev/null \
+    || fail "Codex adapter must return valid non-blocking JSON with a systemMessage: $out"
+  [ ! -s "$err" ] || fail "Codex adapter must keep stderr clean on the expected unhealthy-watcher path: $(cat "$err")"
+  queue="$dir/state/.wake-queue"
+  [ -s "$queue" ] || fail "Codex adapter must leave a durable wake when it cannot block"
+  assert_contains "$(cat "$queue")" "codex-turnend-guard" "Codex adapter durable wake must identify its source"
+  assert_contains "$out" "warning queued durably" "Codex adapter must report successful durable wake delivery"
+  assert_not_contains "$out" 'decision:block' "Codex adapter output must not request a blocking decision"
+  assert_not_contains "$command" 'decision:block' "Codex Stop adapter must not return a blocking decision"
+  pass ".codex/hooks.json: unhealthy watcher returns systemMessage JSON and queues durably without blocking Codex"
+}
+
+test_cached_codex_direct_guard_self_routes_without_blocking() {
+  local command dir payload out err status queue
+  # The cached hook command must remain literal so the nested shell expands it at execution time.
+  # shellcheck disable=SC2016
+  command='bash -lc '\''payload=$(cat 2>/dev/null || true); [ -n "$payload" ] || exit 0; command -v jq >/dev/null 2>&1 || exit 0; root=$(pwd -P) || exit 0; [ -x "$root/bin/fm-turnend-guard.sh" ] || exit 0; [ -f "$root/AGENTS.md" ] || exit 0; [ -f "$root/.codex/hooks.json" ] || exit 0; jq -e "any(.hooks.Stop[]?.hooks[]?.command?; type == \"string\" and contains(\"fm-turnend-guard.sh\"))" "$root/.codex/hooks.json" >/dev/null 2>&1 || exit 0; printf "%s" "$payload" | "$root/bin/fm-turnend-guard.sh"'\'''
+  dir=$(make_primary_dir "$TMP_ROOT/codex-hook-cached-direct")
+  mkdir -p "$dir/.codex"
+  cp "$ROOT/.codex/hooks.json" "$dir/.codex/hooks.json"
+  : > "$dir/state/task1.meta"
+  payload='{"session_id":"session-test","turn_id":"turn-test","transcript_path":null,"cwd":"/tmp","hook_event_name":"Stop","model":"gpt-test","permission_mode":"bypassPermissions","stop_hook_active":false,"last_assistant_message":"OK"}'
+  err="$dir/cached-codex.err"
+  out=$(printf '%s' "$payload" | (cd "$dir" && bash -c "$command") 2>"$err"); status=$?
+  expect_code 0 "$status" "a cached Codex hook that directly invokes the shared guard must fail open"
+  printf '%s' "$out" | jq -e '.continue == true and (.systemMessage | contains("openai/codex#20783"))' >/dev/null \
+    || fail "cached Codex direct guard must return valid non-blocking warning JSON: $out"
+  [ ! -s "$err" ] || fail "cached Codex direct guard must keep stderr clean: $(cat "$err")"
+  queue="$dir/state/.wake-queue"
+  [ -s "$queue" ] || fail "cached Codex direct guard must leave a durable wake"
+  assert_contains "$(cat "$queue")" "codex-turnend-guard" "cached Codex durable wake must identify its source"
+  pass "fm-turnend-guard: cached Codex direct command self-routes through the fail-open adapter"
+}
+
+test_codex_adapter_reports_durable_wake_failure() {
+  local settings command dir payload out err status
+  settings="$ROOT/.codex/hooks.json"
+  command=$(jq -r '.hooks.Stop[0].hooks[0].command // empty' "$settings")
+  dir=$(make_primary_dir "$TMP_ROOT/codex-hook-wake-failure")
+  mkdir -p "$dir/.codex"
+  cp "$settings" "$dir/.codex/hooks.json"
+  : > "$dir/state/task1.meta"
+  payload='{"session_id":"session-test","turn_id":"turn-test","hook_event_name":"Stop","stop_hook_active":false}'
+  err="$dir/codex-wake-failure.err"
+  out=$(printf '%s' "$payload" | (cd "$dir" && FM_WAKE_QUEUE="$dir/state" bash -c "$command") 2>"$err"); status=$?
+  expect_code 0 "$status" "Codex adapter must fail open when durable wake delivery fails"
+  printf '%s' "$out" | jq -e '.continue == true and (.systemMessage | contains("durable warning could not be queued"))' >/dev/null \
+    || fail "Codex adapter must report durable wake delivery failure: $out"
+  assert_not_contains "$out" "warning queued durably" "Codex adapter must not claim failed wake delivery succeeded"
+  [ ! -s "$err" ] || fail "Codex adapter must keep stderr clean after wake delivery failure: $(cat "$err")"
+  pass "fm-turnend-guard-codex: reports durable wake delivery failure"
+}
+
+test_codex_adapter_bounds_durable_wake_contention() {
+  local settings command dir payload out err status owner holder start elapsed
+  settings="$ROOT/.codex/hooks.json"
+  command=$(jq -r '.hooks.Stop[0].hooks[0].command // empty' "$settings")
+  dir=$(make_primary_dir "$TMP_ROOT/codex-hook-wake-contention")
+  mkdir -p "$dir/.codex"
+  cp "$settings" "$dir/.codex/hooks.json"
+  : > "$dir/state/task1.meta"
+  owner="$dir/state/held-wake-owner"
+  mkdir -p "$owner"
+  sleep 30 &
+  holder=$!
+  printf '%s\n' "$holder" > "$owner/pid"
+  ln -s "$owner" "$dir/state/.wake-queue.lock"
+  payload='{"session_id":"session-test","turn_id":"turn-test","hook_event_name":"Stop","stop_hook_active":false}'
+  err="$dir/codex-wake-contention.err"
+  start=$SECONDS
+  out=$(printf '%s' "$payload" | (cd "$dir" && bash -c "$command") 2>"$err"); status=$?
+  elapsed=$((SECONDS - start))
+  kill "$holder" 2>/dev/null || true
+  wait "$holder" 2>/dev/null || true
+  expect_code 0 "$status" "Codex adapter must fail open when durable wake delivery times out"
+  [ "$elapsed" -lt 4 ] || fail "Codex adapter spent ${elapsed}s waiting for the durable wake lock"
+  printf '%s' "$out" | jq -e '.continue == true and (.systemMessage | contains("durable warning timed out"))' >/dev/null \
+    || fail "Codex adapter must report bounded wake lock contention: $out"
+  [ ! -s "$err" ] || fail "Codex adapter must keep stderr clean after wake contention: $(cat "$err")"
+  pass "fm-turnend-guard-codex: bounds and reports durable wake contention"
+}
+
+test_cached_codex_direct_guard_ignores_adapter_failure() {
+  local dir payload out status
+  dir=$(make_primary_dir "$TMP_ROOT/codex-hook-cached-adapter-failure")
+  cat > "$dir/bin/fm-turnend-guard-codex.sh" <<'EOF'
+#!/usr/bin/env bash
+cat >/dev/null
+exit 2
+EOF
+  chmod +x "$dir/bin/fm-turnend-guard-codex.sh"
+  payload='{"session_id":"session-test","turn_id":"turn-test","transcript_path":null,"cwd":"/tmp","hook_event_name":"Stop","model":"gpt-test","permission_mode":"bypassPermissions","stop_hook_active":false,"last_assistant_message":"OK"}'
+  out=$(printf '%s' "$payload" | bash "$dir/bin/fm-turnend-guard.sh" 2>&1); status=$?
+  expect_code 0 "$status" "cached Codex compatibility boundary must fail open even when its adapter exits 2"
+  [ -z "$out" ] || fail "failing Codex adapter stub unexpectedly produced output: $out"
+  pass "fm-turnend-guard: cached Codex compatibility route ignores adapter failure status"
+}
+
+test_claude_direct_guard_still_blocks_without_codex_turn_id() {
+  local dir payload out status
+  dir=$(make_primary_dir "$TMP_ROOT/claude-hook-direct")
+  : > "$dir/state/task1.meta"
+  payload='{"session_id":"session-test","transcript_path":null,"cwd":"/tmp","hook_event_name":"Stop","permission_mode":"bypassPermissions","stop_hook_active":false,"last_assistant_message":"OK"}'
+  out=$(printf '%s' "$payload" | CLAUDECODE=1 bash "$dir/bin/fm-turnend-guard.sh" 2>&1); status=$?
+  expect_code 2 "$status" "Claude direct Stop guard must retain blocking exit status"
+  assert_contains "$out" "TURN WOULD END BLIND" "Claude direct Stop guard must preserve its continuation reason"
+  assert_not_contains "$out" '"continue":true' "Claude direct Stop guard must not return the Codex fail-open result"
+  pass "fm-turnend-guard: Claude direct command still blocks without Codex's turn_id extension"
 }
 
 test_codex_hook_uses_process_pwd_when_payload_cwd_is_outside_root() {
@@ -728,7 +1027,14 @@ test_hook_x_mode_reason_sources_cadence
 test_hook_ignores_repo_state_when_fm_home_set
 test_hook_uses_state_override
 test_hook_loop_guard_allows_retry
-test_hook_silent_in_secondmate_home
+test_hook_blocks_in_secondmate_own_home
+test_hook_silent_in_idle_secondmate_home
+test_hook_secondmate_loop_guard_allows_retry
+test_hook_secondmate_reinvoke_recovery_loop
+test_hook_silent_in_secondmate_child_worktree
+test_hook_blocks_in_treehouse_leased_secondmate_home
+test_hook_exempts_linked_worktree_with_stray_marker
+test_hook_exempts_linked_worktree_with_non_ascii_marker
 test_hook_silent_in_crewmate_worktree
 test_hook_silent_without_jq
 test_hook_silent_without_stdin
@@ -737,6 +1043,12 @@ test_grok_adapter_forces_one_resume_when_unhealthy
 test_grok_adapter_loop_guard_skips_resume
 test_settings_hook_uses_claude_project_dir
 test_codex_hook_invokes_shared_guard
+test_codex_hook_never_blocks_when_watcher_is_unhealthy
+test_codex_adapter_reports_durable_wake_failure
+test_codex_adapter_bounds_durable_wake_contention
+test_cached_codex_direct_guard_self_routes_without_blocking
+test_cached_codex_direct_guard_ignores_adapter_failure
+test_claude_direct_guard_still_blocks_without_codex_turn_id
 test_codex_hook_uses_process_pwd_when_payload_cwd_is_outside_root
 test_codex_hook_ignores_nested_git_root_guard
 test_opencode_plugin_forces_followup
